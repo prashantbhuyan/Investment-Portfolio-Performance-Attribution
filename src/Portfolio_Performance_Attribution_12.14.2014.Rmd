@@ -1,0 +1,375 @@
+---
+title: Performance Attribution of a Quantitative Investment Portfolio (is607 Final
+  Project)
+author: "Prashant B. Bhuyan"
+date: "December 13, 2014"
+output: pdf_document
+---
+
+The purpose of this project is to measure how much of the performance of a diversified quantitative investment portfolio is significantly impacted by random market behavior, if at all.  If successful, the results of this analysis will lay the groundwork for a broader analysis pertaining to the separation of alpha and beta across the investment portfolio.  If the "luck" portion of the portfolio can be measured dynamically (accounting for lags etc) then a hedging tool could potentially eliminate random market risk without eroding portfolio returns in times of erratic market behavior.
+
+The methodology is to obtain historical performance data from 11 different trading models (mean reversion, pairs, market making, momentum, statistical arbitrage, etc) that together form a diversified investment portfolio over a particularly volatile trading period.  I will explore the data by analyzing the distribution of performance across symbols and across time periods to reveal the structure of the performance data and how it relates to and is impacted by market behavior.  I will then model the data to measure how much of the performance is explained by the market and market volatility, its clustering tendencies and its correlation to the predictor variables.  
+
+Finally, I will interpret the results and reconcile the results with my original hypothesis to determine if it makes sense to continue work to create a hedging instrument for the portfolio.
+
+
+
+```{r set-options}
+options(width = 200)
+
+# import requisite libraries
+library(RPostgreSQL)
+library(DBI)
+library(plyr)
+library(dplyr)
+library(ggplot2)
+library(quantmod)
+library(zoo)
+library(timeSeries)
+library(stats)
+library(tm)
+library(wordcloud)
+library(RColorBrewer)
+library(bitops)
+library(RCurl)
+# library(yaml)
+
+
+# set working directory and path that contains the raw data for 11 trading models.
+setwd("~/Desktop/is607FinalProject/rawdata")
+path <- "~/Desktop/is607FinalProject/rawdata"
+
+# PARTS 1 & 2: OBTAIN & SCRUB. 
+# read performance data of 11 diff models into a single data frame
+# approximately 75,000 observations of 22 variables 
+# across 11 unique csv files of differing length.
+
+# connect to postgresql db where we will store our data frame so that we 
+# can easily extend the observational data when new data is available.
+drv <- dbDriver("PostgreSQL")
+con <- dbConnect(drv, dbname = "postgres", host = "localhost", port = 5433, 
+                 user = "postgres", password = "z8yjcpfw")
+
+# read data from all the files in the directory and store in a single data 
+# frame.
+merged_data <- do.call(rbind,lapply(list.files(path),read.csv))
+
+# create a new data frame containing only important variables for our analysis.  
+# make sure data types are appropriate for each variable.
+pruned_data <- 
+  data.frame(merged_data$Account.Name, merged_data$Security, 
+            as.Date(merged_data$Trade.Date, '%m/%d/%Y'), 
+            as.numeric(merged_data$Realized.PnL.Gross),
+            as.numeric(merged_data$Unrealized.Changed..Day.Wise.),
+            as.numeric(merged_data$GMV),as.numeric(merged_data$NMV))
+
+# rename columns to simplify references.
+colnames(pruned_data) <- c('acct','sym','date','realized','unrealized','gmv','nmv')
+
+# write aggregated data frame to database.
+dbWriteTable(con, "pruned_datatb", pruned_data)
+
+# check data was properly loaded to db by running a query and verifying the results.
+dbGetQuery(con, 
+           "select * from pruned_datatb where pruned_datatb.acct = 
+           'model11' limit 5")
+
+# add all data to a table for future extensibility.
+data_tb <- dbGetQuery(con, "select * from pruned_datatb")
+
+# check data table.  
+head(data_tb)
+
+
+# PART 3: EXPLORE DATA
+
+# slice out sym, realized and date, realized into two sep data frame.
+sym_realized_datadf <- select(pruned_data,sym,realized)
+day_realized_datadf <- select(pruned_data,date,realized)
+
+# manipulate data - first group pnl by symbol and std of pnl by symbol
+pnl_dist_symdf <- ddply(sym_realized_datadf,~sym,summarise,pnl=sum(realized),
+                        stdev=sd(realized))
+head(pnl_dist_symdf)
+tail(pnl_dist_symdf)
+
+# next group pnl by day and std of pnl by day.
+
+pnl_dist_daydf <- ddply(day_realized_datadf,~date,summarise,pnl=sum(realized),
+                        stdev=sd(realized))
+head(pnl_dist_daydf)
+tail(pnl_dist_daydf)
+
+# write pnl_dist data to db for later extensibility.
+dbWriteTable(con, "pnl_dist_symdf_tb", pnl_dist_symdf)
+dbWriteTable(con, "pnl_dist_daydf_tb", pnl_dist_daydf)
+
+```
+
+```{r fig.width = 8, fig.height = 11}
+
+# create a word cloud that represents the frequency of symbols traded in the portf.
+# below is the code to create and save the word cloud image which I import below.
+#
+# sym_freq <- pruned_data$sym
+# corp = Corpus(VectorSource(sym_freq))
+# word_matrix <- TermDocumentMatrix(corp,control = list(removePunctuation=TRUE))
+# matrix <- as.matrix(word_matrix)
+# word_freqs <- sort(rowSums(matrix), decreasing = TRUE)
+# word_freqdf <- data.frame(word = names(word_freqs),freq = word_freqs)
+
+# wordcloud(word_freqdf$word, word_freqdf$freq, random.order = FALSE, colors = brewer     
+#.pal(.5,"Dark2"))
+
+#png("SymbolFrequency.png",width = 5, height = 8, units = "in", res = 300)
+#wordcloud(word_freqdf$word, word_freqdf$freq, random.order = FALSE, colors = brewer
+#.pal(8,"Dark2"))
+#dev.off()
+
+library(grid)
+library(png)
+img <- readPNG("/Users/MicrostrRes/Desktop/is607FinalProject/SymbolFrequency.png")
+grid.raster(img)
+
+```
+
+The word cloud above shows that the portfolio of strategies indeed does trade more frequenty in certain symbols as compared to other symbols.  For example, hban and cma are very frequently traded as are yhoo, ivz, msft and ezu.  On the other hand dgi, hrl, axp are much less frequently traded. 
+
+Below I rank the pnl by symbol and interestingly CMA which is the portfolio's most frequently traded symbol is also the 4th worst loss out of 916 symbols traded.  
+
+```{r}
+
+# let's see our pnl distribution over the traded symbols and days.
+ranked_pnlby_sym <- dbGetQuery(con, "select * from pnl_dist_symdf_tb order by pnl desc")
+
+ranked_pnlby_date <- dbGetQuery(con, "select * from pnl_dist_daydf_tb order by pnl desc")
+
+# rank most profitable symbols.
+head(ranked_pnlby_sym)
+
+# sum of biggest gaining symbols
+sum(head(ranked_pnlby_sym$pnl))
+
+# rank least profitable symbols.
+tail(ranked_pnlby_sym)
+
+# sum of biggest losing symbols
+sum(tail(ranked_pnlby_sym$pnl))
+
+# rank most profitable days
+head(ranked_pnlby_date)
+
+# rank least profitable days
+tail(ranked_pnlby_date)
+
+# sum most profitable days
+sum(head(ranked_pnlby_date$pnl))
+
+# sum least profitable days
+sum(tail(ranked_pnlby_date$pnl))
+
+
+# explore data types of pnl-by-sym table.
+str(dbGetQuery(con, "select * from pnl_dist_symdf_tb"))
+
+# explore the dimensionality of the data.  Here we see that the length of the 
+# pnl-dist-by-date table spans 44 days.
+dim(dbGetQuery(con, "select * from pnl_dist_daydf_tb"))[1]
+
+# explore data types of pnl-by-date table.
+str(dbGetQuery(con, "select * from pnl_dist_daydf_tb"))
+
+# summarize pnl distribution by symbol.
+summary(dbGetQuery(con, "select * from pnl_dist_symdf_tb"))
+
+# summarize pnl distribution by day.
+summary(dbGetQuery(con, "select * from pnl_dist_daydf_tb"))
+
+# visualization of pnl-distribution-by-symbols.  it's interseting that 2 symbols 
+#yielded losses of over -$25,000 while only one symbol yielded a profit of greater 
+#than $25,000.
+ggplot(pnl_dist_symdf, aes(x = pnl_dist_symdf$sym, y = pnl_dist_symdf$pnl))+
+  geom_point(shape=1)+ggtitle("PnL Distribution Over Symbols")+xlab("sym")+ylab("pnl ($)")
+
+# visualization of std of pnl-distribution-by-sym. this is interesting because a hand 
+#full of stocks are very volatile.  A further area of exploration may be the beta 
+#composition of those stocks.
+ggplot(pnl_dist_symdf, aes(x = pnl_dist_symdf$sym, y = pnl_dist_symdf$stdev))+
+  geom_point(shape=1)+ggtitle("Stdev of PnL Distribution by Symbol")+xlab("sym")+
+  ylab("stdev ($)")
+
+# visualizations of pnl-distribution-by-date.  we can see that volatility in the 
+#distribution of pnl increased in Mid-October 2014.
+ggplot(pnl_dist_daydf, aes(x = pnl_dist_daydf$date, y = pnl_dist_daydf$pnl))+
+  geom_point(shape=1)+geom_line()+ggtitle("PnL Distribution by Day")+
+  xlab("date")+ylab("pnl ($)")
+
+# visualization of std dev of pnl by date.  here we see that the volatility of our 
+#pnl increased substantively on days between october 15 and october 22.
+ggplot(pnl_dist_daydf, aes(x = pnl_dist_daydf$date, y = pnl_dist_daydf$stdev))+
+  geom_point(shape=1)+ggtitle("Stdev of PnL Distribution by Day")+
+  xlab("date")+ylab("stdev ($)")
+
+# visualization of the portfolio's cumulative pnl over dates.  here we see that a 
+# steady upward pnl movement was interrupted by a sharp drop in performance in mid 
+#October.
+ggplot(pnl_dist_daydf, aes(x = pnl_dist_daydf$date, y = cumsum(pnl_dist_daydf$pnl)))+
+  geom_point(shape=1) + geom_line() + 
+  ggtitle("Cumulative PnL Over Days") + 
+  xlab("date") + ylab("cumulative pnl ($)")
+
+# let's read in market data for the SPY and VXX Adjusted Close Prices so that we can 
+#see how the market impacted our portfolio's performance over the given period.
+
+tickers <- c('SPY', 'VXX')
+
+start <- as.Date("2014-09-01")
+end <- as.Date("2014-10-31")
+
+getSymbols(tickers, src = "yahoo", from = start, to = end)
+
+adj_closeSPY <- SPY$SPY.Adjusted
+adj_closeVXX <- VXX$VXX.Adjusted
+
+
+# visualization of SPY performance which is a proxy for the overall market.  
+# we see that the sharp drop in performance in the SPY is similar to the sharp 
+# drop in performance of our portfolio's performance.  The primary question is 
+# what is the market's impact on the the portfolio's performance and can it be 
+# backed out via a hedge?  In other words how much of our portfolio's return is 
+# based on luck (whether the market goes up and down) and how much is based on 
+# skill in picking stock trades?
+
+chart_Series(adj_closeSPY)
+
+# visualization of volatility index over the same period.  What is role of market 
+#volatility in determining the returns of the portfolio?
+
+chart_Series(adj_closeVXX)
+
+# PART4: MODEL 
+# K-Means Clustering Analysis
+# I will use k-means clustering to try and identify any structure in the distribution 
+# of the pnl of the portfolio versus the market and the volatility of the market.  
+
+# First i need to create a new df that contains the portfolio returns, market returns 
+# and market volatility index returns.
+model_data_df_pnldate <- data.frame(cumsum(pnl_dist_daydf$pnl),adj_closeSPY,adj_closeVXX)
+colnames(model_data_df_pnldate) <- c('pnl','spyclose','vxx_close')
+
+# check that the data frame was constructed properly.
+head(model_data_df_pnldate)
+
+# compute results from k-means clustering analysis
+results <- kmeans(model_data_df_pnldate,3)
+
+# output results - there are certain dates, particularly from 10.15.2014 - 10.20.2014 
+# where the portfolio's pnl clusters with market returns and volatility.
+results
+
+plot(model_data_df_pnldate[c('pnl','vxx_close','spyclose')],col=results$cluster)
+plot(model_data_df_pnldate[c('pnl','spyclose')],col = results$cluster)
+plot(model_data_df_pnldate[c('pnl','vxx_close')],col = results$cluster)
+plot(model_data_df_pnldate[c('spyclose','vxx_close')],col = results$cluster)
+
+# Next I'll perform a multi regression analysis where the portfolio pnl is the 
+# dependent variable and the market and its volatility are the independent variables 
+# for the purpose of determining what part of portfolio return is explained by the 
+# independent variables and if both variables are significant or if one or both of 
+# them should be dropped.
+
+# compute multi linear regression.
+linear_model <- lm(model_data_df_pnldate$pnl ~ model_data_df_pnldate$spyclose + 
+                     model_data_df_pnldate$vxx_close)
+
+# output results from multi-linear regression.  both predictor variables have an 
+# impact on portfolio pnl with low p values.  More in interpretation section below.
+summary(linear_model)
+
+# run a correlation analysis between pnl vs spy.
+cor_model <- cor(model_data_df_pnldate$pnl,model_data_df_pnldate$spyclose,
+                 method ="pearson")
+cor_model
+
+# run a correlation analysis between pnl vs vxx.
+cor_model2 <- cor(model_data_df_pnldate$pnl,model_data_df_pnldate$vxx_close,
+                  method = "pearson")
+cor_model2
+
+# run a correlation analysis between pnl and vxx+spy
+cor_model3 <- cor(model_data_df_pnldate$pnl, (model_data_df_pnldate$vxx_close+
+                                                model_data_df_pnldate$spyclose),
+                  method = "pearson")
+
+# compute confidence interval of slope of both spy and vxx predictors.
+conf_interval <- confint(linear_model,conf.level = 0.95)
+conf_interval
+
+plot(linear_model)
+
+```
+
+
+INTERPRETATION
+
+The data used in the analysis spans 44 trading sessions and 916 unique securities across 11 different models that make up one master portfolio.  The data contain 75,048 observations of 22 variables.  For this analysis the data was pruned to 75,048 observations of 7 variables.
+
+PnL for the most part is evenly distributed across symbols; however, some symbols are traded more often than others.  CMA in particular was an interesting case because it was amongst the most frequently traded symbols as well as the 4th worst loser of 916 symbols traded. 
+                    
+Based on the summaries of the pnl distributions by symbol and by day it seems that major wins and losses are concentrated by symbol and/or by day.  This points to the conclusion that large losses and gains are concentrated in a handful of symbols and a handful of days.  
+
+In fact the sum of the top 5 winners is just +$83,738.91 while the sum of the top 5 losers is -$129,431.80.  
+
+The top 5 winning days yields a profit of just +$79,070.12 while the sum of the top 5 losing days yields a loss of -$148,560.50.
+
+Since it is clear that the performance of the portfolio is highly dependent on just a few symbols and days its important to then investigate how the performance of the portfolio was impacted by market behavior. 
+
+In fact as is clear above the top 5 worst losing days were between October 15th and October 21st.  Over that period of time the stock market benchmark index SPY dropped sharply and volatility of the market benchmarked by the VXX spiked sharply. 
+                                                             
+K-Means Clustering Results
+
+The portfolio pnl indeed does cluster with the SPY and VXX indices from 10.15.2014 to 10.20.2014 which is an interesting pattern.  
+
+The next question that arises is does sharp increases in volatility of the market cause the portfolio pnl to move with market returns?  
+
+If this is the case, could a hedge be created to mitigate the market risk (beta) to protect against sharpe spikes in market volatility?  How can the volatility and correlation to the market of individual symbols be measured in order to create such a hedge?  What kind of lags are involved?  
+
+Multi Linear Regression and Correlation Results
+
+We regress the SPY and VXX against the portfolio pnl to determine what portion of the portfolio pnl could be explained by SPY and VXX.  In this case the portfolio pnl is the dependent variable while the SPY and VXX are independent variables.
+
+From the multi linear regression above we see an R-squared of 0.2657 which means that 26.57% of the variation in the portfolio's pnl can be explained by the spy close and the vxx close prices.  
+
+The p-value tests the null hypothesis that the coefficients of the model with the predictors in place are 0 (have no effect). A p-value < .05 suggests that we can reject the null hypothesis and in this case since the p-value = .001779 we can conclude that the predictors - spy price and vxx price - are meaningful because changes in both indices affect how the portfolio's pnl changes. Individually each predictor affects the portfolio pnl and there is no need to discard either of the predictors.
+
+Correlation Results
+
+The portfolio pnl is negatively correlated to the SPY at -.2019.
+
+The portfolio pnl is not very correlated to the vxx which is showing a correlation of .0467. 
+
+However, the portfolio pnl has a decent negative correlation to the SPY+VXX as a unit of -.5126.
+
+Confidence Intervals:
+
+At a 95% confidence interval the true slope for the SPY predictor is between -$25,663.33 and -$7,960.96.
+
+At a 95% confidence true slope for the VXX predictor is -$27,365.06 and -$7,497.98.  
+
+CONCLUSIONS
+
+My hypothesis was that the portfolio's performance was impacted by the overall market and volatility during its latest drawdown in pnl.  The findings support my conclusion and show market returns and volatility account for a signficant portion of the portfolio pnl behavior and that the portfolio pnl is negatively correlated to the market and market volatility.  
+
+Further, it can be gleaned that performance is concentrated across a handful of symbols and days despite having traded across 916 symbols.  On the days where market volatility is extreme the portfolio pnl clusters with market returns and volatility.  
+
+As such this study was successful and merits further investigation into the construction of a beta hedge that would seek to quantify on a symbol specific basis the market risk component.  Once the market risk component can be measured on a symbol specific basis and aggregated across the portfolio a hedging mechanism could created to separate the alpha and beta components of the portfolio.  If the future work proves successful then we would be left with a positive portfolio return that is not susceptiple to wild market moves and extensive risk concentration.  In other words, a successful beta hedge would yield a cumulative portfolio pnl curve that would not have drawn down in mid-october. 
+
+
+
+
+
+
+
+
+
+
